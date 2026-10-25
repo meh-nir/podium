@@ -1186,7 +1186,7 @@ function modeNote(){
   if (mode() === "exact"){
     showNote(engine && !engine.ready
       ? "Whisper is loading on your computer (a few seconds on first start)…"
-      : "<b>Exact mode.</b> Your answer is recorded, and when you press Stop, Whisper writes down everything you said, including um, uh, repeats, stutters and long pauses. It takes about a third of your speaking time. Nothing leaves your computer.");
+      : "<b>Exact mode.</b> Your words appear as you talk. Grey-ish draft words at the end are replaced by an exact version (every um, repeat and stutter) each time you pause. Nothing leaves your computer.");
     return;
   }
   if (mode() === "type") showNote("Press <b>Start</b>, then click in the box below and press <kbd>Win</kbd> + <kbd>H</kbd>. Windows voice typing writes down what you say. On a phone, tap the microphone on your keyboard instead. If voice typing wipes the box and starts again, just keep talking: the page saves every part and joins them when you press Stop.");
@@ -1269,8 +1269,11 @@ function beginSpeaking(){
   const wantRec = $("#rec-audio").checked;
   exactWords = [];
   if (mode() === "exact"){
-    srStatus("Recording… speak freely. Your exact words appear when you press Stop.");
-    startAudio().then(ok => { if (!ok && phase === "speak") showNote("The microphone could not be opened. Click the camera/mic icon in Chrome's address bar, allow the microphone, then press Stop and Start again."); });
+    srStatus("Listening… your words appear as you talk.");
+    startAudio().then(ok => {
+      if (!ok && phase === "speak") showNote("The microphone could not be opened. Click the camera/mic icon in Chrome's address bar, allow the microphone, then press Stop and Start again.");
+      else if (ok && phase === "speak" && media.stream) liveStart(media.stream);
+    });
   } else if (mode() === "mic" && SR){
     // Open the recorder first (if wanted), then start recognition, so the two never fight over the mic mid-sentence.
     if (wantRec) startAudio().then(() => { if (phase === "speak") startRecognition(); });
@@ -1298,7 +1301,7 @@ function tick(){
   $("#clock").textContent = fmtTime(el);
   const f = el / task.target;
   setRing(f, f < 0.8 ? "var(--good)" : f < 1.15 ? "var(--spot)" : "var(--bad)");
-  if (mode() === "exact"){
+  if (mode() === "exact" && !live.sid){
     $("#l-words").textContent = "…"; $("#l-wpm").textContent = "–"; $("#l-fill").textContent = "…";
   } else {
     const txt = mode() === "type" ? fullText() : $("#transcript").value;
@@ -1354,10 +1357,11 @@ function startRecognition(){
   } catch(e){ micBroken = true; setMode("type"); modeNote(); }
 }
 function recWatchdog(){
-  // Chrome sometimes goes deaf without ending the session. If nothing has come back for 7 s, restart it.
+  // Chrome sometimes goes deaf without ending the session. If nothing has come back for 25 s, restart it.
+  // (A shorter limit cut sessions off while Chrome was still working on what you said.)
   if (!recWanted || micBroken || !rec) return;
   const now = Date.now();
-  if (now - Math.max(lastHeard, lastRecStart) > 7000){ lastRecStart = now; srStatus("Reconnecting the microphone…"); try { rec.abort(); } catch(e){} }
+  if (now - Math.max(lastHeard, lastRecStart) > 25000){ lastRecStart = now; srStatus("Reconnecting the microphone…"); try { rec.abort(); } catch(e){} }
 }
 function stopRecognition(){ recWanted = false; if (rec){ const r = rec; try { r.stop(); } catch(e){} } }
 
@@ -1426,6 +1430,62 @@ function stopSpeaking(){
   }, mode() === "mic" ? 900 : 300);
 }
 
+/* Live words in exact mode: send 16 kHz audio to the engine every ~0.4 s and show what comes back.
+   "final" is already polished word for word; "partial" is a quick draft of the sentence you are still saying. */
+const live = {sid:null, ctx:null, node:null, src:null, buf:[], len:0, final:"", partial:"", q:Promise.resolve()};
+async function liveStart(stream){
+  live.sid = null; live.buf = []; live.len = 0; live.final = ""; live.partial = ""; live.q = Promise.resolve();
+  try {
+    const r = await fetch("/stream/start", {method:"POST"});
+    const j = await r.json();
+    if (!r.ok || !j.sid) return;
+    if (phase !== "speak") return;
+    live.sid = j.sid;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    live.ctx = new AC({sampleRate:16000});
+    live.src = live.ctx.createMediaStreamSource(stream);
+    live.node = live.ctx.createScriptProcessor(4096, 1, 1);
+    live.node.onaudioprocess = e => {
+      if (!live.sid) return;
+      const f = e.inputBuffer.getChannelData(0), out = new Int16Array(f.length);
+      for (let i = 0; i < f.length; i++){ const v = Math.max(-1, Math.min(1, f[i])); out[i] = v < 0 ? v * 32768 : v * 32767; }
+      live.buf.push(out); live.len += out.length;
+      if (live.len >= 6400) liveSend();
+    };
+    live.src.connect(live.node); live.node.connect(live.ctx.destination);
+  } catch(e){ live.sid = null; }
+}
+function liveSend(){
+  if (!live.sid || !live.len) return live.q;
+  const out = new Int16Array(live.len); let o = 0;
+  live.buf.forEach(b => { out.set(b, o); o += b.length; }); live.buf = []; live.len = 0;
+  const sid = live.sid;
+  live.q = live.q.then(async () => {
+    try {
+      const r = await fetch("/stream/chunk?sid=" + sid, {method:"POST", body:out.buffer, headers:{"Content-Type":"application/octet-stream"}});
+      const j = await r.json();
+      if (r.ok){ live.final = j.final || ""; live.partial = j.partial || ""; showLive(); }
+    } catch(e){}
+  });
+  return live.q;
+}
+function showLive(){
+  if (phase !== "speak" || mode() !== "exact") return;
+  const t = $("#transcript");
+  t.value = (live.final + (live.partial ? " " + live.partial + " …" : "")).trim();
+  t.scrollTop = t.scrollHeight;
+}
+async function liveFinish(){
+  try { if (live.node) live.node.disconnect(); if (live.src) live.src.disconnect(); if (live.ctx) live.ctx.close(); } catch(e){}
+  live.node = live.src = live.ctx = null;
+  await liveSend();
+  const sid = live.sid; live.sid = null;
+  const r = await fetch("/stream/finish?sid=" + sid, {method:"POST"});
+  const j = await r.json().catch(() => ({error:"The engine sent back an unreadable answer."}));
+  if (!r.ok || j.error) throw new Error(j.error || "Live transcription failed.");
+  return j;
+}
+
 function withPauses(words){
   let out = "", prevEnd = null;
   (words || []).forEach(w => {
@@ -1436,15 +1496,20 @@ function withPauses(words){
 }
 async function transcribeExact(){
   $("#btn-start").hidden = true; $("#btn-new").disabled = true;
-  const t1 = Date.now(), est = Math.max(5, Math.round((task.spoken || 0) * 0.35 + 3));
-  const show = () => srStatus("Whisper is writing down every word… " + Math.round((Date.now() - t1) / 1000) + " s (usually about " + est + " s)");
+  const wasLive = !!live.sid;
+  const t1 = Date.now(), est = wasLive ? 3 : Math.max(5, Math.round((task.spoken || 0) * 0.35 + 3));
+  const show = () => srStatus((wasLive ? "Polishing your last sentence… " : "Whisper is writing down every word… ") + Math.round((Date.now() - t1) / 1000) + " s (usually about " + est + " s)");
   show(); const iv = setInterval(show, 500);
   try {
-    const blob = await (media.done || Promise.resolve(null));
-    if (!blob) throw new Error("No recording was captured. Allow the microphone (icon in Chrome's address bar) and try again.");
-    const r = await fetch("/transcribe", {method:"POST", body:blob, headers:{"Content-Type": blob.type || "audio/webm"}});
-    const j = await r.json().catch(() => ({error:"The engine sent back an unreadable answer."}));
-    if (!r.ok || j.error) throw new Error(j.error || "Transcription failed.");
+    let j = null;
+    if (wasLive){ try { j = await liveFinish(); } catch(e){ j = null; } }
+    if (!j || (!(j.words || []).length && (task.spoken || 0) > 5)){
+      const blob = await (media.done || Promise.resolve(null));
+      if (!blob) throw new Error("No recording was captured. Allow the microphone (icon in Chrome's address bar) and try again.");
+      const r = await fetch("/transcribe", {method:"POST", body:blob, headers:{"Content-Type": blob.type || "audio/webm"}});
+      j = await r.json().catch(() => ({error:"The engine sent back an unreadable answer."}));
+      if (!r.ok || j.error) throw new Error(j.error || "Transcription failed.");
+    }
     exactWords = j.words || [];
     $("#transcript").value = exactWords.length ? withPauses(exactWords) : (j.text || "");
   } catch(e){
