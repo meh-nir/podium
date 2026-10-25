@@ -1177,7 +1177,15 @@ async function checkEngine(n){
 }
 checkEngine(0);
 // Tell the engine this page is still open. It stops itself about 3 minutes after the last ping (page closed).
-if (/^(127\.0\.0\.1|localhost)$/.test(location.hostname)) setInterval(() => { fetch("/health", {cache:"no-store"}).catch(() => {}); }, 60000);
+// Chrome slows timers in background tabs, so ping every 30 s and again whenever you come back to the tab.
+if (/^(127\.0\.0\.1|localhost)$/.test(location.hostname)){
+  const ping = () => fetch("/health", {cache:"no-store"}).then(r => r.json()).catch(() => null).then(j => {
+    if (!j && phase !== "speak" && mode() === "exact") showNote("The Podium engine has stopped (it closes itself a few minutes after the page is closed, or after your computer sleeps). Double-click the <b>Podium</b> icon on your Desktop to start it again.");
+  });
+  setInterval(ping, 30000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) ping(); });
+  window.addEventListener("focus", ping);
+}
 
 function showNote(html){ const n = $("#mic-note"); n.innerHTML = html; n.hidden = !html; }
 function modeNote(){
