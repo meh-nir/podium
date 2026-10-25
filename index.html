@@ -1176,6 +1176,8 @@ async function checkEngine(n){
   } catch(e){}
 }
 checkEngine(0);
+// Tell the engine this page is still open. It stops itself about 3 minutes after the last ping (page closed).
+if (/^(127\.0\.0\.1|localhost)$/.test(location.hostname)) setInterval(() => { fetch("/health", {cache:"no-store"}).catch(() => {}); }, 60000);
 
 function showNote(html){ const n = $("#mic-note"); n.innerHTML = html; n.hidden = !html; }
 function modeNote(){
@@ -1242,7 +1244,7 @@ $("#btn-start").addEventListener("click", async () => {
   if (mode() === "exact"){
     let j = null;
     try { j = await (await fetch("/health", {cache:"no-store"})).json(); } catch(e){}
-    if (!j || !j.ok){ showNote("The Podium engine has stopped (it closes itself after 3 hours without use). Double-click the <b>Podium</b> icon on your Desktop, then press Start."); return; }
+    if (!j || !j.ok){ showNote("The Podium engine has stopped (it closes itself a few minutes after the page is closed, or after your computer sleeps). Double-click the <b>Podium</b> icon on your Desktop, then press Start."); return; }
     if (!j.ready){ showNote(j.error ? esc(j.error) : "Whisper is still loading. Wait a few seconds, then press Start."); return; }
   }
   $("#results").hidden = true; $("#claude-out").innerHTML = ""; $("#copy-msg").textContent = "";
