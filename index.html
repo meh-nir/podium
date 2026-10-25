@@ -868,8 +868,8 @@ const RX = {
     /\b(?:kind of|sort of|and stuff|or something|so yeah)\b/gi,
     /(?<!\b(?:would|i|you|we|they|he|she|people|don't|didn't|do|does|did|feel|feels|felt|look|looks|looked|seem|seems|sound|sounds|really|just|not|things|something|anything|more|most|much|exactly|i'd|we'd|you'd|it's|that's)\s)\blike\b/gi
   ],
-  hedge: [/\b(?:i think|i guess|i feel like|maybe|perhaps|probably|i'm not sure|i am not sure|a little bit|sorry|i don't know|just)\b/gi],
-  sign: [/\b(?:first(?:ly)?|secondly|second point|thirdly|finally|however|therefore|for example|for instance|in addition|moreover|as a result|on the other hand|in conclusion|to sum up|which means|this means|in other words|the main reason|to begin with|most importantly|although|whereas|because of this|that is why|in short)\b/gi]
+  hedge: [/\b(?:i think|i guess|i feel like|maybe|perhaps|probably|i'm not sure|i am not sure|a little bit|sorry|i don't know)\b/gi],
+  sign: [/\b(?:first of all|first(?:ly)?|to (?:begin|start) with|secondly|second|thirdly|third|then|next|after that|also|another|in addition|moreover|as well as|because|since|the (?:main )?reason|one reason|that's why|that is why|therefore|as a result|so that|which means|this means|for example|for instance|such as|in other words|however|but|although|whereas|on the other hand|in my (?:opinion|view)|most importantly|finally|overall|in the end|in conclusion|to sum up|in short)\b/gi]
 };
 function findAll(rxList, text, cls){
   const out = [];
@@ -888,6 +888,24 @@ function mattr(words, win){
 const stemMatch = (word, list) => list.some(x => { const a = x.toLowerCase(); return word === a || (a.length > 3 && word.startsWith(a.slice(0, Math.max(4, a.length-2)))); });
 
 const PAUSE_RX = /\[pause ([\d.]+)s\]/g;
+/* Structure: what a listener needs to follow you.
+   Linking words (up to 4 different ones), a reason, an example, and a clear ending. */
+const RX_REASON = /\b(?:because|since|the (?:main )?reason|one reason|that's why|that is why|as a result|therefore)\b/i;
+const RX_EXAMPLE = /\b(?:for example|for instance|such as|like when|imagine|in my (?:village|family|fieldwork|research)|one (?:woman|man|family|person|time|day))\b|\b\d+\b/i;
+const RX_ENDING = /\b(?:so overall|overall|in the end|in conclusion|to sum up|in short|that's why|that is why|so,? in short|to conclude|finally|so the (?:main )?point)\b/i;
+function structureParts(text, signs){
+  const clean = text.replace(PAUSE_RX, " ");
+  const links = new Set(signs.map(x => x.t.replace(/^the main reason$/, "the reason"))).size;
+  const tail = clean.slice(Math.floor(clean.length * 0.7));
+  return {links, reason: RX_REASON.test(clean), example: RX_EXAMPLE.test(clean), ending: RX_ENDING.test(tail)};
+}
+function structureScore(text, signs, sec){
+  const p = structureParts(text, signs);
+  const base = sec < 40 ? 40 : 25;              // short answers (pitches, Just a Minute) need less scaffolding
+  const linkPts = Math.min(p.links, 4) / 4 * (sec < 40 ? 25 : 35);
+  return clamp(Math.round(base + linkPts + (p.reason ? 10 : 0) + (p.example ? 15 : 0) + (p.ending ? 15 : 0)), 0, 100);
+}
+
 function analyze(text, sec, task){
   // Pause markers like "[pause 2.4s]" come from Exact mode; they are timings, not words.
   const pauses = []; let pm; PAUSE_RX.lastIndex = 0;
@@ -906,21 +924,29 @@ function analyze(text, sec, task){
   for (let i = 1; i < n; i++) if (words[i] === words[i-1] && words[i].length < 8) restarts++;
   for (let i = 0; i + 3 < n; i++) if (words[i] === words[i+2] && words[i+1] === words[i+3] && words[i] !== words[i+1]) restarts++;
   const stutters = stutterMarks.length;
-  const longPauses = pauses.filter(p => p >= 2.5).length;
-  const wpm = sec >= 5 ? Math.round(n / min) : 0;
+  const longPauses = pauses.filter(p => p >= 3).length;
+  // Exact mode (Whisper) keeps every um and stutter, so only then can fluency be judged.
+  const verbatim = (typeof exactWords !== "undefined") && exactWords.length > 0;
+  // Pace uses the time from your first word to your last, so silence before and after doesn't count.
+  const speakSec = verbatim ? Math.max(1, exactWords[exactWords.length - 1].end - exactWords[0].start) : sec;
+  const wpm = speakSec >= 5 ? Math.round(n / (speakSec / 60)) : 0;
   const fpm = sec >= 5 ? fillers.length / min : 0;
   const hedgeRate = n ? hedges.length / n * 100 : 0;
+  const disfluency = n ? (fillers.length + restarts + stutters) / n * 100 : 0;
   const variety = mattr(words, 40);
   const isRead = !!task.read;
   const target = task.target;
 
-  const sub = {};
-  const lo = isRead ? 115 : 115, hi = isRead ? 155 : 165;
-  if (wpm > 0) sub.pace = wpm < lo ? clamp(100 - (lo - wpm) * 2.2, 0, 100) : wpm > hi ? clamp(100 - (wpm - hi) * 2.2, 0, 100) : 100;
-  sub.fluency = clamp(100 - fpm * 9 - restarts * 3 - stutters * 3 - longPauses * 4, 0, 100);
+  const sub = {}, unmeasured = [];
+  // Pace: 100 inside the comfortable range, then a gentle curve. 63 wpm ≈ 45, 90 ≈ 78, 190 ≈ 60.
+  const lo = isRead ? 110 : 105, hi = isRead ? 160 : 165;
+  if (wpm > 0) sub.pace = wpm < lo ? clamp(100 * Math.pow(wpm / lo, 1.6), 5, 100) : wpm > hi ? clamp(100 - (wpm - hi) * 1.6, 5, 100) : 100;
+  // Fluency: fillers, repeats and cut-off words per 100 words (about 3 is normal even for fluent speakers), plus long freezes.
+  if (verbatim) sub.fluency = clamp(100 - Math.max(0, disfluency - 3) * 4.5 - Math.min(20, longPauses * 4), 10, 100);
+  else unmeasured.push("fluency");
   if (!isRead){
-    sub.confidence = clamp(100 - hedgeRate * 10, 0, 100);
-    sub.structure = sec < 40 ? clamp(55 + signDistinct * 20, 0, 100) : clamp(30 + signDistinct * 15, 0, 100);
+    sub.confidence = clamp(100 - hedgeRate * 8, 20, 100);
+    sub.structure = structureScore(text, signs, sec);
     sub.vocabulary = variety == null ? 50 : clamp((variety - 0.5) / 0.3 * 100, 0, 100);
   }
   const r = target ? sec / target : 1;
@@ -956,12 +982,14 @@ function analyze(text, sec, task){
     sub.clarity = extra.accuracy;
   }
 
-  const W = {pace:.2, fluency:.25, confidence:.12, structure:.13, vocabulary:.1, length:.1, rules:.2, clarity:.45};
+  const W = {pace:.2, fluency:.3, confidence:.1, structure:.2, vocabulary:.1, length:.1, rules:.2, clarity:.45};
   if (task.id === "clear"){ delete sub.length; delete sub.pace; }
+  Object.keys(sub).forEach(k => { sub[k] = Math.round(sub[k]); });
   let tw = 0, ts = 0; Object.keys(sub).forEach(k => { tw += W[k]; ts += W[k] * sub[k]; });
   let score = n === 0 ? 0 : Math.round(ts / tw);
+  const structure = isRead ? null : structureParts(text, signs);
 
-  return {n, sec, wpm, fillers, hedges, signs, signDistinct, restarts, stutters, pauses, longPauses, fpm, hedgeRate, variety, sub, score, extra, marks, text};
+  return {n, sec, speakSec, wpm, verbatim, disfluency, unmeasured, structure, fillers, hedges, signs, signDistinct, restarts, stutters, pauses, longPauses, fpm, hedgeRate, variety, sub, score, extra, marks, text};
 }
 
 function markText(text, marks){
@@ -981,7 +1009,7 @@ function coachTips(a, task){
     pace:"Your pace (" + a.wpm + " words per minute) is in the comfortable range for listeners. Keep it.",
     fluency:"Very few fillers. That makes you sound prepared and in control.",
     confidence:"You stated your points directly, without hiding behind \"maybe\" and \"I think\".",
-    structure:"You used signpost words, so a listener could follow where you were going.",
+    structure:"Your answer had a clear shape: linking words, a reason, an example and an ending. A listener could follow you.",
     vocabulary:"Good variety of words. You didn't lean on the same few words.",
     length:"You used your time well: not too short, not too long.",
     rules:"You played by the game's rules. That takes quick thinking.",
@@ -1004,7 +1032,14 @@ function coachTips(a, task){
       const ex = Array.from(new Set(a.hedges.map(f => f.t))).slice(0,3).map(x => "\"" + x + "\"").join(", ");
       tips.push({t:"Words like " + ex + " make your points sound unsure. Say the point plainly: \"My research shows…\" instead of \"I think maybe…\"."});
     }
-    if (k === "structure") tips.push({t:"Give your listener a map. Start with your answer in one sentence, then use \"First… Second… Finally…\", or follow PREP: Point, Reason, Example, Point."});
+    if (k === "structure"){
+      const p = a.structure || {}, miss = [];
+      if (p.links < 3) miss.push("linking words (\"first\", \"also\", \"another\", \"but\")");
+      if (!p.reason) miss.push("a reason (\"because…\", \"the reason is…\")");
+      if (!p.example) miss.push("an example (\"for example, in my village…\")");
+      if (!p.ending) miss.push("a clear ending (\"so overall…\", \"in short…\")");
+      tips.push({t:"Your answer was missing " + (miss.length ? miss.join(", ") : "a clear shape") + ". Try PREP: say your Point in one sentence, give a Reason, an Example, then your Point again."});
+    }
     if (k === "vocabulary") tips.push({t:"You repeated the same words a lot. Before you start, think of two other ways to say your key word."});
     if (k === "length"){
       if (a.sec < task.target) tips.push({t:"You stopped at " + fmtTime(a.sec) + " out of " + fmtTime(task.target) + ". When ideas run out, add a reason and then an example: \"The reason is… For example…\"."});
@@ -1571,9 +1606,10 @@ function renderResults(a){
   $("#r-subs").innerHTML = Object.entries(a.sub).map(([k, v]) => {
     const c = v >= 75 ? "good" : v >= 50 ? "warn" : "bad";
     return '<div class="sub"><div class="sub-top"><span>' + SUB_LABEL[k] + '</span><b>' + Math.round(v) + '</b></div><div class="bar"><i class="' + c + '" style="width:' + Math.round(v) + '%"></i></div></div>';
-  }).join("");
+  }).join("") + (a.unmeasured || []).map(k =>
+    '<div class="sub"><div class="sub-top"><span>' + SUB_LABEL[k] + '</span><b class="muted">not measured</b></div><div class="bar"></div><span class="small muted">This mode hides ums and stutters. Use Exact transcript on the Desktop icon to score it.</span></div>').join("");
   const m = [
-    [a.n, "words"], [a.wpm || "–", "words / min (aim 120–160)"], [a.fillers.length, "fillers heard"], [a.fpm.toFixed(1), "fillers / min (aim under 2)"],
+    [a.n, "words"], [a.wpm || "–", "words / min (aim 105–165)"], [a.fillers.length, "fillers heard"], [a.fpm.toFixed(1), "fillers / min (aim under 2)"],
     [a.hedges.length, "unsure words"], [a.signDistinct, "different signposts"], [a.variety == null ? "–" : Math.round(a.variety * 100) + "%", "word variety"]
   ];
   if (a.pauses.length || a.stutters || exactWords.length){
