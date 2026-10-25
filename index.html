@@ -383,7 +383,9 @@ mark.filler{background:var(--m-filler)} mark.hedge{background:var(--m-hedge)} ma
       <span class="muted">Listen with:</span>
       <label><input type="radio" name="mode" value="mic" id="mode-mic"> Live microphone</label>
       <label><input type="radio" name="mode" value="type" id="mode-type"> Voice typing (<span class="kbd">Win</span>+<span class="kbd">H</span>) or keyboard</label>
+      <label title="Some computers can't transcribe and record at the same time. If your words stop appearing, turn this off."><input type="checkbox" id="rec-audio"> Also record my voice to listen back</label>
     </div>
+    <p class="small muted" id="sr-status" aria-live="polite"></p>
   </div>
 
   <div class="note" id="mic-note" hidden></div>
@@ -1127,6 +1129,8 @@ function modeNote(){
   else showNote("");
 }
 $$('input[name="mode"]').forEach(r => r.addEventListener("change", modeNote));
+$("#rec-audio").checked = !!S.recordAudio;
+$("#rec-audio").addEventListener("change", e => { S.recordAudio = e.target.checked; save(); });
 
 function loadGame(id, go){
   if (phase === "speak" || phase === "think"){ show("stage"); return; }
@@ -1188,12 +1192,21 @@ function beginSpeaking(){
   clearInterval(timer);
   phase = "speak"; t0 = Date.now(); task.bombs = task.bombEvery ? [] : undefined; task.nextBomb = 6;
   $("#btn-skip").hidden = true; $("#btn-stop").hidden = false; $("#phase").textContent = "Speak";
-  micBroken = false; restarts = 0;
-  if (mode() === "mic" && SR) startRecognition(); else $("#transcript").focus();
-  startAudio();
+  micBroken = false; restarts = 0; lastInterim = ""; media.pauses = null; media.longest = 0;
   $("#rec-ind").hidden = false;
   timer = setInterval(tick, 200); tick();
+  const wantRec = $("#rec-audio").checked;
+  if (mode() === "mic" && SR){
+    // Open the recorder first (if wanted), then start recognition, so the two never fight over the mic mid-sentence.
+    if (wantRec) startAudio().then(() => { if (phase === "speak") startRecognition(); });
+    else startRecognition();
+  } else {
+    $("#transcript").focus();
+    if (wantRec) startAudio();
+  }
 }
+let lastInterim = "", lastHeard = 0, lastRecStart = 0;
+function srStatus(t){ $("#sr-status").textContent = t; }
 function tick(){
   const now = Date.now();
   if (phase === "think"){
@@ -1204,6 +1217,8 @@ function tick(){
     return;
   }
   if (phase !== "speak") return;
+  recWatchdog();
+  if (!media.an){ const mt = $("#meter"); mt.style.width = Math.max(0, (parseFloat(mt.style.width) || 0) - 15) + "%"; }
   const el = (now - t0) / 1000;
   $("#clock").textContent = fmtTime(el);
   const f = el / task.target;
@@ -1222,18 +1237,27 @@ function tick(){
 }
 
 function startRecognition(){
+  recWanted = true;
   try {
-    rec = new SR();
-    rec.lang = S.profile.lang || "en-US"; rec.continuous = true; rec.interimResults = true; rec.maxAlternatives = 1;
-    rec.onresult = e => {
+    const r0 = new SR();
+    rec = r0;
+    r0.lang = S.profile.lang || "en-US"; r0.continuous = true; r0.interimResults = true; r0.maxAlternatives = 1;
+    r0.onstart = () => { lastRecStart = Date.now(); srStatus("Listening… speak normally."); };
+    r0.onspeechstart = () => { lastHeard = Date.now(); srStatus("Hearing you…"); };
+    r0.onresult = e => {
+      if (rec !== r0) return;
+      lastHeard = Date.now();
       let interim = "";
       for (let i = e.resultIndex; i < e.results.length; i++){
         const r = e.results[i];
         if (r.isFinal) finalText += r[0].transcript.trim() + " "; else interim += r[0].transcript;
       }
+      lastInterim = interim.trim();
       $("#transcript").value = (finalText + interim).replace(/\s+/g, " ").trimStart();
+      $("#meter").style.width = "100%";
     };
-    rec.onerror = e => {
+    r0.onerror = e => {
+      if (e.error === "no-speech" || e.error === "aborted") return;
       if (["not-allowed","service-not-allowed","audio-capture","network","language-not-supported"].includes(e.error)){
         micBroken = true; setMode("type");
         const why = e.error === "network" ? "The speech service could not be reached (it needs internet)." : e.error === "audio-capture" ? "No microphone was found." : "This window doesn't allow live transcription.";
@@ -1241,11 +1265,22 @@ function startRecognition(){
         $("#transcript").focus();
       }
     };
-    rec.onend = () => { if (recWanted && !micBroken && restarts < 60){ restarts++; try { rec.start(); } catch(e){} } };
-    recWanted = true; rec.start();
+    r0.onend = () => {
+      if (rec !== r0) return;
+      // Keep words that were still "in progress" when Chrome closed the session.
+      if (lastInterim){ finalText += lastInterim + " "; lastInterim = ""; $("#transcript").value = finalText.replace(/\s+/g, " ").trimStart(); }
+      if (recWanted && !micBroken && restarts < 2000){ restarts++; setTimeout(() => { if (recWanted && rec === r0) startRecognition(); }, 150); }
+    };
+    r0.start();
   } catch(e){ micBroken = true; setMode("type"); modeNote(); }
 }
-function stopRecognition(){ recWanted = false; if (rec){ try { rec.stop(); } catch(e){} } }
+function recWatchdog(){
+  // Chrome sometimes goes deaf without ending the session. If nothing has come back for 7 s, restart it.
+  if (!recWanted || micBroken || !rec) return;
+  const now = Date.now();
+  if (now - Math.max(lastHeard, lastRecStart) > 7000){ lastRecStart = now; srStatus("Reconnecting the microphone…"); try { rec.abort(); } catch(e){} }
+}
+function stopRecognition(){ recWanted = false; if (rec){ const r = rec; try { r.stop(); } catch(e){} } }
 
 async function startAudio(){
   media.chunks = []; if (media.url){ URL.revokeObjectURL(media.url); media.url = null; }
@@ -1297,7 +1332,7 @@ function stopSpeaking(){
   clearInterval(timer);
   task.spoken = (Date.now() - t0) / 1000;
   phase = "done";
-  stopRecognition(); stopAudio();
+  stopRecognition(); stopAudio(); srStatus("");
   $("#btn-stop").hidden = true; $("#rec-ind").hidden = true; $("#phase").textContent = "Done";
   $("#audio-wrap").hidden = true;
   setTimeout(() => {
