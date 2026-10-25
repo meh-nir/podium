@@ -174,7 +174,7 @@ select{width:auto}
 .metric span{font-size:.8rem;color:var(--muted)}
 .marked{background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:14px;line-height:1.9;max-height:320px;overflow:auto;overflow-wrap:anywhere}
 mark{border-radius:4px;padding:1px 3px;color:inherit}
-mark.filler{background:var(--m-filler)} mark.hedge{background:var(--m-hedge)} mark.sign{background:var(--m-sign)} mark.ban{background:var(--m-bad);text-decoration:line-through} mark.bomb{background:var(--m-bomb)} mark.miss{background:var(--m-filler)}
+mark.filler{background:var(--m-filler)} mark.hedge{background:var(--m-hedge)} mark.sign{background:var(--m-sign)} mark.ban{background:var(--m-bad);text-decoration:line-through} mark.bomb{background:var(--m-bomb)} mark.miss{background:var(--m-filler)} mark.stutter{background:var(--m-filler);text-decoration:underline wavy var(--bad)} mark.pause{background:transparent;border:1px dashed var(--muted);color:var(--muted);font-family:var(--f-mono);font-size:.78em;white-space:nowrap}
 .legend{display:flex;gap:12px;flex-wrap:wrap;font-size:.82rem;color:var(--muted)}
 .tips{display:grid;gap:10px;margin:0;padding:0;list-style:none}
 .tips li{display:grid;grid-template-columns:auto 1fr;gap:10px;align-items:start;background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
@@ -381,6 +381,7 @@ mark.filler{background:var(--m-filler)} mark.hedge{background:var(--m-hedge)} ma
     </div>
     <div class="mode" id="mode-row">
       <span class="muted">Listen with:</span>
+      <label id="exact-wrap" hidden><input type="radio" name="mode" value="exact" id="mode-exact"> <b>Exact transcript</b> (every um, repeat and stutter)</label>
       <label><input type="radio" name="mode" value="mic" id="mode-mic"> Live microphone</label>
       <label><input type="radio" name="mode" value="type" id="mode-type"> Voice typing (<span class="kbd">Win</span>+<span class="kbd">H</span>) or keyboard</label>
       <label title="Some computers can't transcribe and record at the same time. If your words stop appearing, turn this off."><input type="checkbox" id="rec-audio"> Also record my voice to listen back</label>
@@ -401,6 +402,7 @@ mark.filler{background:var(--m-filler)} mark.hedge{background:var(--m-hedge)} ma
   <label class="field" for="transcript">What you said <span class="muted small" style="font-weight:400">(appears while you talk; you can fix recognition mistakes afterwards)</span>
     <textarea id="transcript" rows="6" placeholder="Your words will appear here."></textarea>
   </label>
+  <p class="note" id="kept" hidden></p>
 
   <section class="card results" id="results" hidden>
     <div class="res-top">
@@ -420,9 +422,9 @@ mark.filler{background:var(--m-filler)} mark.hedge{background:var(--m-hedge)} ma
     </div>
     <div style="display:grid;gap:8px">
       <h4>Your words, marked</h4>
-      <div class="legend"><span><mark class="filler">filler</mark></span><span><mark class="hedge">unsure word</mark></span><span><mark class="sign">signpost (good)</mark></span><span id="lg-extra"></span></div>
+      <div class="legend"><span><mark class="filler">filler</mark></span><span><mark class="hedge">unsure word</mark></span><span><mark class="sign">signpost (good)</mark></span><span><mark class="stutter">stutter</mark></span><span><mark class="pause">pause 2.0s</mark></span><span id="lg-extra"></span></div>
       <div class="marked" id="r-marked"></div>
-      <p class="small muted">Speech recognition quietly deletes many "um" and "uh" sounds, so your real filler count is probably higher. Listening to your recording is the honest check.</p>
+      <p class="small muted" id="verbatim-note">Speech recognition quietly deletes many "um" and "uh" sounds, so your real filler count is probably higher. Listening to your recording is the honest check.</p>
     </div>
     <div id="audio-wrap" hidden style="display:grid;gap:6px">
       <h4>Listen back</h4>
@@ -885,15 +887,26 @@ function mattr(words, win){
 }
 const stemMatch = (word, list) => list.some(x => { const a = x.toLowerCase(); return word === a || (a.length > 3 && word.startsWith(a.slice(0, Math.max(4, a.length-2)))); });
 
+const PAUSE_RX = /\[pause ([\d.]+)s\]/g;
 function analyze(text, sec, task){
-  const words = wordsOf(text);
+  // Pause markers like "[pause 2.4s]" come from Exact mode; they are timings, not words.
+  const pauses = []; let pm; PAUSE_RX.lastIndex = 0;
+  const pauseMarks = [];
+  while ((pm = PAUSE_RX.exec(text))){ pauses.push(+pm[1]); pauseMarks.push({s:pm.index, e:pm.index + pm[0].length, cls:"pause"}); }
+  const words = wordsOf(text.replace(PAUSE_RX, " "));
   const n = words.length;
   const min = Math.max(sec, 1) / 60;
   const fillers = findAll(RX.filler, text, "filler");
   const hedges = findAll(RX.hedge, text, "hedge");
   const signs = findAll(RX.sign, text, "sign");
   const signDistinct = new Set(signs.map(x => x.t)).size;
-  let restarts = 0; for (let i = 1; i < n; i++) if (words[i] === words[i-1] && words[i].length < 8) restarts++;
+  // Stutters: cut-off words such as "I-" or "mi-" (Whisper writes them with a dash), and repeated words or word pairs.
+  const stutterMarks = findAll([/\b[a-z']{1,12}-(?=\s|,|$)/gi], text, "stutter");
+  let restarts = 0;
+  for (let i = 1; i < n; i++) if (words[i] === words[i-1] && words[i].length < 8) restarts++;
+  for (let i = 0; i + 3 < n; i++) if (words[i] === words[i+2] && words[i+1] === words[i+3] && words[i] !== words[i+1]) restarts++;
+  const stutters = stutterMarks.length;
+  const longPauses = pauses.filter(p => p >= 2.5).length;
   const wpm = sec >= 5 ? Math.round(n / min) : 0;
   const fpm = sec >= 5 ? fillers.length / min : 0;
   const hedgeRate = n ? hedges.length / n * 100 : 0;
@@ -904,7 +917,7 @@ function analyze(text, sec, task){
   const sub = {};
   const lo = isRead ? 115 : 115, hi = isRead ? 155 : 165;
   if (wpm > 0) sub.pace = wpm < lo ? clamp(100 - (lo - wpm) * 2.2, 0, 100) : wpm > hi ? clamp(100 - (wpm - hi) * 2.2, 0, 100) : 100;
-  sub.fluency = clamp(100 - fpm * 11 - restarts * 4, 0, 100);
+  sub.fluency = clamp(100 - fpm * 9 - restarts * 3 - stutters * 3 - longPauses * 4, 0, 100);
   if (!isRead){
     sub.confidence = clamp(100 - hedgeRate * 10, 0, 100);
     sub.structure = sec < 40 ? clamp(55 + signDistinct * 20, 0, 100) : clamp(30 + signDistinct * 15, 0, 100);
@@ -914,7 +927,7 @@ function analyze(text, sec, task){
   sub.length = r >= 0.8 && r <= 1.3 ? 100 : r < 0.8 ? clamp(r / 0.8 * 100, 0, 100) : clamp(100 - (r - 1.3) * 120, 0, 100);
 
   const extra = {};
-  const marks = [].concat(fillers, hedges, signs);
+  const marks = [].concat(pauseMarks, stutterMarks, fillers, hedges, signs);
   if (task.banned){
     const used = [];
     const lower = text.toLowerCase();
@@ -948,7 +961,7 @@ function analyze(text, sec, task){
   let tw = 0, ts = 0; Object.keys(sub).forEach(k => { tw += W[k]; ts += W[k] * sub[k]; });
   let score = n === 0 ? 0 : Math.round(ts / tw);
 
-  return {n, sec, wpm, fillers, hedges, signs, signDistinct, restarts, fpm, hedgeRate, variety, sub, score, extra, marks, text};
+  return {n, sec, wpm, fillers, hedges, signs, signDistinct, restarts, stutters, pauses, longPauses, fpm, hedgeRate, variety, sub, score, extra, marks, text};
 }
 
 function markText(text, marks){
@@ -958,7 +971,7 @@ function markText(text, marks){
   return out + esc(text.slice(pos));
 }
 
-const SUB_LABEL = {pace:"Pace", fluency:"Fluency (fillers)", confidence:"Confident wording", structure:"Structure", vocabulary:"Word variety", length:"Use of time", rules:"Game rules", clarity:"Words understood"};
+const SUB_LABEL = {pace:"Pace", fluency:"Fluency (fillers, repeats, freezes)", confidence:"Confident wording", structure:"Structure", vocabulary:"Word variety", length:"Use of time", rules:"Game rules", clarity:"Words understood"};
 
 function coachTips(a, task){
   const tips = [];
@@ -983,7 +996,9 @@ function coachTips(a, task){
     }
     if (k === "fluency"){
       const ex = Array.from(new Set(a.fillers.map(f => f.t))).slice(0,3).map(x => "\"" + x + "\"").join(", ");
-      tips.push({t: a.fillers.length + " fillers (" + a.fpm.toFixed(1) + " per minute)" + (ex ? ", mostly " + ex : "") + (a.restarts ? ", and " + a.restarts + " restarts" : "") + ". Replace each one with a short silent pause. Silence sounds confident to listeners; it only feels long to you."});
+      tips.push({t: a.fillers.length + " fillers (" + a.fpm.toFixed(1) + " per minute)" + (ex ? ", mostly " + ex : "") + (a.restarts ? ", " + a.restarts + " repeated words" : "") + (a.stutters ? ", " + a.stutters + " cut-off words" : "") + ". Replace each one with a short silent pause. Silence sounds confident to listeners; it only feels long to you."});
+      if (a.restarts + a.stutters >= 3) tips.push({t:"Repeats like \"I think, I think\" usually mean you started talking before you knew the end of the sentence. Decide the first five words, then say them once, slowly. A clean restart (\"Let me say that again.\") is better than three half-starts."});
+      if (a.longPauses >= 2) tips.push({t:"You froze for more than 2.5 seconds " + a.longPauses + " times (marked in grey below). Short pauses are good; long ones mean you lost the thread. Bridge with \"Let me put it another way…\" or go back to your main point and repeat it."});
     }
     if (k === "confidence"){
       const ex = Array.from(new Set(a.hedges.map(f => f.t))).slice(0,3).map(x => "\"" + x + "\"").join(", ");
@@ -1118,14 +1133,63 @@ let game = GAMES[0], task = null, phase = "idle", t0 = 0, thinkEnd = 0, timer = 
 let rec = null, recWanted = false, micBroken = false, finalText = "", restarts = 0;
 let media = {stream:null, rec:null, chunks:[], ctx:null, an:null, url:null};
 
-function setMode(m){ $("#mode-mic").checked = m === "mic"; $("#mode-type").checked = m === "type"; }
-const mode = () => $("#mode-mic").checked ? "mic" : "type";
+/* Voice typing (Win + H, phone keyboards) sometimes restarts and overwrites the box with only the newest phrase.
+   We never write to the box while someone is dictating (that breaks the dictation); we only watch it.
+   When the box suddenly holds a different sentence, the earlier text is kept here and joined back at Stop. */
+let kept = [], prevVal = "";
+const firstWords = t => wordsOf(t).slice(0, 3).join(" ");
+const fullText = () => kept.concat([$("#transcript").value]).join(" ").replace(/\s+/g, " ").trim();
+function renderKept(){
+  const k = $("#kept");
+  if (!kept.length){ k.hidden = true; return; }
+  k.hidden = false;
+  k.innerHTML = "<b>Saved so far</b> (voice typing restarted " + kept.length + (kept.length === 1 ? " time" : " times") + "; nothing is lost, keep talking): " + esc(kept.join(" "));
+}
+$("#transcript").addEventListener("input", () => {
+  if (phase !== "speak" || mode() !== "type") return;
+  const v = $("#transcript").value, p = prevVal.trim(), vt = v.trim();
+  const isDeletion = p.toLowerCase().startsWith(vt.toLowerCase());
+  if (p.length >= 8 && vt.length > 0 && !isDeletion && firstWords(v) !== firstWords(p)) kept.push(p);
+  prevVal = v;
+  renderKept();
+});
+
+function setMode(m){ $("#mode-exact").checked = m === "exact"; $("#mode-mic").checked = m === "mic"; $("#mode-type").checked = m === "type"; }
+const mode = () => $("#mode-exact").checked ? "exact" : $("#mode-mic").checked ? "mic" : "type";
 if (!SR){ $("#mode-mic").disabled = true; setMode("type"); }
 else setMode(inViewer ? "type" : "mic");
 
+/* Exact mode: when this page is served by the Podium engine on this computer (Whisper), record the answer
+   and get a word-for-word transcript with timings, including fillers, repeats, stutters and pauses. */
+let engine = null, exactWords = [];
+async function checkEngine(n){
+  if (!/^(127\.0\.0\.1|localhost)$/.test(location.hostname)) return;
+  try {
+    const r = await fetch("/health", {cache:"no-store"});
+    const j = await r.json();
+    if (!j.ok) return;
+    const first = !engine; engine = j;
+    $("#exact-wrap").hidden = false;
+    if (first && phase === "idle") setMode("exact");
+    modeNote();
+    if (!j.ready && n < 120) setTimeout(() => checkEngine(n + 1), 2000);
+  } catch(e){}
+}
+checkEngine(0);
+
 function showNote(html){ const n = $("#mic-note"); n.innerHTML = html; n.hidden = !html; }
 function modeNote(){
-  if (mode() === "type") showNote("Press <b>Start</b>, then click in the box below and press <kbd>Win</kbd> + <kbd>H</kbd>. Windows voice typing writes down what you say. On a phone, tap the microphone on your keyboard instead. You can also type, but speaking is the point.");
+  const vn = $("#verbatim-note");
+  if (vn) vn.textContent = mode() === "exact"
+    ? "Exact mode keeps every um, uh, repeat and stutter (written like \"I- I\"), and marks pauses longer than 1.5 seconds."
+    : "Speech recognition quietly deletes many \"um\" and \"uh\" sounds and stutters, so your real filler count is probably higher. Exact mode (Desktop icon) keeps them all.";
+  if (mode() === "exact"){
+    showNote(engine && !engine.ready
+      ? "Whisper is loading on your computer (a few seconds on first start)…"
+      : "<b>Exact mode.</b> Your answer is recorded, and when you press Stop, Whisper writes down everything you said, including um, uh, repeats, stutters and long pauses. It takes about a third of your speaking time. Nothing leaves your computer.");
+    return;
+  }
+  if (mode() === "type") showNote("Press <b>Start</b>, then click in the box below and press <kbd>Win</kbd> + <kbd>H</kbd>. Windows voice typing writes down what you say. On a phone, tap the microphone on your keyboard instead. If voice typing wipes the box and starts again, just keep talking: the page saves every part and joins them when you press Stop.");
   else showNote("");
 }
 $$('input[name="mode"]').forEach(r => r.addEventListener("change", modeNote));
@@ -1174,7 +1238,13 @@ $("#btn-new").addEventListener("click", newTask);
 $("#source").addEventListener("change", newTask);
 $("#nerves-before").addEventListener("input", e => { $("#nb-out").textContent = e.target.value; });
 
-$("#btn-start").addEventListener("click", () => {
+$("#btn-start").addEventListener("click", async () => {
+  if (mode() === "exact"){
+    let j = null;
+    try { j = await (await fetch("/health", {cache:"no-store"})).json(); } catch(e){}
+    if (!j || !j.ok){ showNote("The Podium engine has stopped (it closes itself after 3 hours without use). Double-click the <b>Podium</b> icon on your Desktop, then press Start."); return; }
+    if (!j.ready){ showNote(j.error ? esc(j.error) : "Whisper is still loading. Wait a few seconds, then press Start."); return; }
+  }
   $("#results").hidden = true; $("#claude-out").innerHTML = ""; $("#copy-msg").textContent = "";
   $("#transcript").value = ""; finalText = "";
   $("#btn-start").hidden = true; $("#btn-new").disabled = true;
@@ -1193,10 +1263,15 @@ function beginSpeaking(){
   phase = "speak"; t0 = Date.now(); task.bombs = task.bombEvery ? [] : undefined; task.nextBomb = 6;
   $("#btn-skip").hidden = true; $("#btn-stop").hidden = false; $("#phase").textContent = "Speak";
   micBroken = false; restarts = 0; lastInterim = ""; media.pauses = null; media.longest = 0;
+  kept = []; prevVal = $("#transcript").value; renderKept();
   $("#rec-ind").hidden = false;
   timer = setInterval(tick, 200); tick();
   const wantRec = $("#rec-audio").checked;
-  if (mode() === "mic" && SR){
+  exactWords = [];
+  if (mode() === "exact"){
+    srStatus("Recording… speak freely. Your exact words appear when you press Stop.");
+    startAudio().then(ok => { if (!ok && phase === "speak") showNote("The microphone could not be opened. Click the camera/mic icon in Chrome's address bar, allow the microphone, then press Stop and Start again."); });
+  } else if (mode() === "mic" && SR){
     // Open the recorder first (if wanted), then start recognition, so the two never fight over the mic mid-sentence.
     if (wantRec) startAudio().then(() => { if (phase === "speak") startRecognition(); });
     else startRecognition();
@@ -1223,11 +1298,15 @@ function tick(){
   $("#clock").textContent = fmtTime(el);
   const f = el / task.target;
   setRing(f, f < 0.8 ? "var(--good)" : f < 1.15 ? "var(--spot)" : "var(--bad)");
-  const txt = $("#transcript").value;
-  const w = wordsOf(txt).length;
-  $("#l-words").textContent = w;
-  $("#l-wpm").textContent = el > 8 ? Math.round(w / (el / 60)) : "–";
-  $("#l-fill").textContent = findAll(RX.filler, txt, "f").length;
+  if (mode() === "exact"){
+    $("#l-words").textContent = "…"; $("#l-wpm").textContent = "–"; $("#l-fill").textContent = "…";
+  } else {
+    const txt = mode() === "type" ? fullText() : $("#transcript").value;
+    const w = wordsOf(txt).length;
+    $("#l-words").textContent = w;
+    $("#l-wpm").textContent = el > 8 ? Math.round(w / (el / 60)) : "–";
+    $("#l-fill").textContent = findAll(RX.filler, txt, "f").length;
+  }
   if (task.bombs && el >= task.nextBomb){
     let word; do { word = pick(BOMB_WORDS); } while (task.bombs.some(b => b.word === word));
     task.bombs.push({word, at:Math.round(el)}); task.nextBomb += task.bombEvery;
@@ -1284,21 +1363,24 @@ function stopRecognition(){ recWanted = false; if (rec){ const r = rec; try { r.
 
 async function startAudio(){
   media.chunks = []; if (media.url){ URL.revokeObjectURL(media.url); media.url = null; }
+  media.blob = null; media.done = new Promise(res => { media.resolveDone = res; });
   try {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
-    const stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true, noiseSuppression:true}});
-    if (phase !== "speak"){ stream.getTracks().forEach(t => t.stop()); return; }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){ media.resolveDone(null); return false; }
+    const stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true, noiseSuppression:true, autoGainControl:true}});
+    if (phase !== "speak"){ stream.getTracks().forEach(t => t.stop()); media.resolveDone(null); return false; }
     media.stream = stream;
     if (window.MediaRecorder){
       media.rec = new MediaRecorder(stream);
       media.rec.ondataavailable = e => { if (e.data && e.data.size) media.chunks.push(e.data); };
       media.rec.onstop = () => {
-        if (!media.chunks.length) return;
-        media.url = URL.createObjectURL(new Blob(media.chunks, {type: media.rec.mimeType || "audio/webm"}));
+        if (!media.chunks.length){ media.resolveDone(null); return; }
+        const blob = new Blob(media.chunks, {type: media.rec.mimeType || "audio/webm"});
+        media.blob = blob; media.url = URL.createObjectURL(blob);
         $("#r-audio").src = media.url; $("#audio-wrap").hidden = false;
+        media.resolveDone(blob);
       };
       media.rec.start(500);
-    }
+    } else media.resolveDone(null);
     const AC = window.AudioContext || window.webkitAudioContext;
     if (AC){
       media.ctx = new AC(); const src = media.ctx.createMediaStreamSource(stream);
@@ -1318,7 +1400,8 @@ async function startAudio(){
       };
       requestAnimationFrame(loop);
     }
-  } catch(e){ /* microphone not available here: transcription by voice typing still works */ }
+    return true;
+  } catch(e){ /* microphone not available here: transcription by voice typing still works */ if (media.resolveDone) media.resolveDone(null); return false; }
 }
 function stopAudio(){
   try { if (media.rec && media.rec.state !== "inactive") media.rec.stop(); } catch(e){}
@@ -1335,10 +1418,42 @@ function stopSpeaking(){
   stopRecognition(); stopAudio(); srStatus("");
   $("#btn-stop").hidden = true; $("#rec-ind").hidden = true; $("#phase").textContent = "Done";
   $("#audio-wrap").hidden = true;
+  if (mode() === "exact"){ transcribeExact(); return; }
   setTimeout(() => {
     $("#btn-start").hidden = false; $("#btn-start").textContent = "Start again"; $("#btn-new").disabled = false;
+    if (kept.length){ $("#transcript").value = fullText(); kept = []; renderKept(); }
     runAnalysis(true);
   }, mode() === "mic" ? 900 : 300);
+}
+
+function withPauses(words){
+  let out = "", prevEnd = null;
+  (words || []).forEach(w => {
+    if (prevEnd != null && w.start - prevEnd >= 1.5) out += " [pause " + (w.start - prevEnd).toFixed(1) + "s] ";
+    out += w.word; prevEnd = w.end;
+  });
+  return out.replace(/\s+/g, " ").trim();
+}
+async function transcribeExact(){
+  $("#btn-start").hidden = true; $("#btn-new").disabled = true;
+  const t1 = Date.now(), est = Math.max(5, Math.round((task.spoken || 0) * 0.35 + 3));
+  const show = () => srStatus("Whisper is writing down every word… " + Math.round((Date.now() - t1) / 1000) + " s (usually about " + est + " s)");
+  show(); const iv = setInterval(show, 500);
+  try {
+    const blob = await (media.done || Promise.resolve(null));
+    if (!blob) throw new Error("No recording was captured. Allow the microphone (icon in Chrome's address bar) and try again.");
+    const r = await fetch("/transcribe", {method:"POST", body:blob, headers:{"Content-Type": blob.type || "audio/webm"}});
+    const j = await r.json().catch(() => ({error:"The engine sent back an unreadable answer."}));
+    if (!r.ok || j.error) throw new Error(j.error || "Transcription failed.");
+    exactWords = j.words || [];
+    $("#transcript").value = exactWords.length ? withPauses(exactWords) : (j.text || "");
+  } catch(e){
+    exactWords = [];
+    showNote(esc((e && e.message) || "Transcription failed.") + (String(e && e.message).includes("fetch") ? " Is the Podium engine still running? Double-click the Desktop icon again." : ""));
+  }
+  clearInterval(iv); srStatus("");
+  $("#btn-start").hidden = false; $("#btn-start").textContent = "Start again"; $("#btn-new").disabled = false;
+  runAnalysis(true);
 }
 
 function runAnalysis(saveIt){
@@ -1386,7 +1501,10 @@ function renderResults(a){
     [a.n, "words"], [a.wpm || "–", "words / min (aim 120–160)"], [a.fillers.length, "fillers heard"], [a.fpm.toFixed(1), "fillers / min (aim under 2)"],
     [a.hedges.length, "unsure words"], [a.signDistinct, "different signposts"], [a.variety == null ? "–" : Math.round(a.variety * 100) + "%", "word variety"]
   ];
-  if (media.pauses != null && media.longest) m.push([media.pauses, "pauses over 3 s"]);
+  if (a.pauses.length || a.stutters || exactWords.length){
+    m.push([a.restarts + a.stutters, "repeats & stutters"]);
+    m.push([a.pauses.filter(p => p >= 2).length, "pauses over 2 s"]);
+  } else if (media.pauses != null && media.longest) m.push([media.pauses, "pauses over 3 s"]);
   if (a.extra.accuracy != null) m.unshift([a.extra.accuracy + "%", "words understood"]);
   $("#r-metrics").innerHTML = m.map(([v, l]) => '<div class="metric"><b>' + esc(v) + '</b><span>' + esc(l) + "</span></div>").join("");
   let ex = "";
@@ -1415,7 +1533,9 @@ function feedbackPrompt(forChat){
   const a = lastAnalysis; const p = S.profile;
   return (forChat ? "Please act as my English speaking coach. " : "You are a warm, honest English speaking coach. ") +
     "The speaker" + (p.name ? " is " + p.name + "," : "") + (p.field ? " studies " + p.field + "," : "") + (p.focus ? " works on " + p.focus + "," : "") + " and their first language is Bangla. They are building confidence for public speaking, presentations and PhD/job interviews.\n" +
-    "Below is an automatic speech-to-text transcript of something they said out loud. Speech recognition drops most 'um's and adds little punctuation, so ignore punctuation and spelling, and treat odd words as possible recognition or pronunciation errors.\n\n" +
+    (exactWords.length
+      ? "Below is a word-for-word (verbatim) transcript of something they said out loud, made by Whisper. It keeps fillers (um, uh), repeated words, cut-off words written like 'I- I', and long pauses marked [pause 2.4s]. Comment on these disfluencies specifically. Treat odd words as possible pronunciation errors.\n\n"
+      : "Below is an automatic speech-to-text transcript of something they said out loud. Speech recognition drops most 'um's and adds little punctuation, so ignore punctuation and spelling, and treat odd words as possible recognition or pronunciation errors.\n\n") +
     "Game: " + task.game + "\nTask: " + task.prompt + (task.read ? "\nText they were reading: " + task.read : "") + "\n" +
     "Time spoken: " + Math.round(a.sec) + " s (target " + task.target + " s). Words: " + a.n + ". Pace: " + a.wpm + " wpm. Fillers detected: " + a.fillers.length + ". Auto score: " + a.score + "/100.\n\n" +
     "Transcript:\n\"\"\"\n" + a.text.slice(0, 6000) + "\n\"\"\"\n\n" +
